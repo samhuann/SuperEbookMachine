@@ -2,6 +2,7 @@ import shutil
 import subprocess
 import threading
 import webbrowser
+import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -68,12 +69,45 @@ def iter_selected_files(in_root: Path, exts: set[str]):
             yield p
 
 
-def build_out_path(in_root: Path, out_root: Path, in_path: Path, out_fmt: str) -> Path:
-    """
-    Preserve folder structure: out_root / (relative path from in_root), with new suffix.
+def _sanitize_filename_component(s: str) -> str:
+    # Windows-invalid filename characters: < > : " / \ | ? *
+    # Also avoid trailing dots/spaces.
+    bad = '<>:"/\\|?*'
+    out = "".join((ch if ch not in bad else "_") for ch in s)
+    out = out.strip().strip(".")
+    return out or "_"
+
+
+def build_out_path(
+    in_root: Path,
+    out_root: Path,
+    in_path: Path,
+    out_fmt: str,
+    *,
+    flatten: bool,
+    keep_input_ext: bool,
+) -> Path:
+    """Build an output path.
+
+    - If flatten=False: preserve folder structure under out_root.
+    - If flatten=True: write everything directly into out_root.
+      To avoid collisions, include the relative parent folders in the filename.
+    - If keep_input_ext=True: keep the input file extension (copy mode).
+      Else: use out_fmt.
     """
     rel = in_path.relative_to(in_root)
-    return (out_root / rel).with_suffix("." + out_fmt.lower().lstrip("."))
+    out_suffix = in_path.suffix if keep_input_ext else ("." + out_fmt.lower().lstrip("."))
+
+    if not flatten:
+        return (out_root / rel).with_suffix(out_suffix)
+
+    base = _sanitize_filename_component(in_path.stem)
+    parent_parts = [_sanitize_filename_component(p) for p in rel.parts[:-1]]
+    if parent_parts:
+        tag = "__".join(parent_parts)
+        base = f"{base}__{tag}"
+    filename = f"{base}{out_suffix}"
+    return out_root / filename
 
 
 class SuperEbookMachine(tk.Tk):
@@ -81,6 +115,8 @@ class SuperEbookMachine(tk.Tk):
         super().__init__()
         self.title("SuperEbookMachine")
         self.geometry("1020x700")
+
+        self._set_window_icon()
 
         # Thread control
         self.stop_event = threading.Event()
@@ -97,6 +133,8 @@ class SuperEbookMachine(tk.Tk):
         self.profile_var = tk.StringVar(value="kindle")
         self.workers_var = tk.IntVar(value=6)
         self.overwrite_var = tk.BooleanVar(value=False)
+        self.flatten_output_var = tk.BooleanVar(value=False)
+        self.no_convert_var = tk.BooleanVar(value=False)
 
         # Input scanning options
         self.ext_vars = {ext: tk.BooleanVar(value=(ext == ".pdf")) for ext in DEFAULT_INPUT_EXTS}
@@ -116,6 +154,19 @@ class SuperEbookMachine(tk.Tk):
 
         self._build_ui()
         self.on_target_change()  # set initial format hint
+
+    def _resource_path(self, relative_path: str) -> Path:
+        base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+        return base / relative_path
+
+    def _set_window_icon(self):
+        icon_path = self._resource_path("SuperEbookMachine.ico")
+        try:
+            if icon_path.exists():
+                self.iconbitmap(str(icon_path))
+        except Exception:
+            # If icon loading fails (or on non-Windows), keep default.
+            pass
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -208,10 +259,11 @@ class SuperEbookMachine(tk.Tk):
         self.out_fmt_combo.grid(row=0, column=1, sticky="w", padx=(6, 18), pady=8)
 
         ttk.Label(opt, text="Output profile:").grid(row=0, column=2, sticky="w", pady=8)
-        ttk.Combobox(
+        self.profile_combo = ttk.Combobox(
             opt, textvariable=self.profile_var, width=12, state="readonly",
             values=["kindle", "kindle_pw3", "tablet", "default"]
-        ).grid(row=0, column=3, sticky="w", padx=(6, 18), pady=8)
+        )
+        self.profile_combo.grid(row=0, column=3, sticky="w", padx=(6, 18), pady=8)
 
         ttk.Label(opt, text="Workers:").grid(row=0, column=4, sticky="w", pady=8)
         ttk.Spinbox(opt, from_=1, to=32, textvariable=self.workers_var, width=6).grid(
@@ -221,6 +273,19 @@ class SuperEbookMachine(tk.Tk):
         ttk.Checkbutton(opt, text="Overwrite existing outputs", variable=self.overwrite_var).grid(
             row=0, column=6, sticky="w", padx=(6, 8), pady=8
         )
+
+        ttk.Checkbutton(
+            opt,
+            text="Flatten output (ignore subfolders)",
+            variable=self.flatten_output_var,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+
+        ttk.Checkbutton(
+            opt,
+            text="Copy originals (no conversion / keep file type)",
+            variable=self.no_convert_var,
+            command=self._refresh_convert_state,
+        ).grid(row=1, column=3, columnspan=4, sticky="w", padx=8, pady=(0, 8))
 
         # Row 6: Buttons
         btns = ttk.Frame(frm)
@@ -258,6 +323,13 @@ class SuperEbookMachine(tk.Tk):
 
         frm.columnconfigure(1, weight=1)
         frm.rowconfigure(9, weight=1)
+
+        self._refresh_convert_state()
+
+    def _refresh_convert_state(self):
+        copying = bool(self.no_convert_var.get())
+        self.out_fmt_combo.config(state="disabled" if copying else "readonly")
+        self.profile_combo.config(state="disabled" if copying else "readonly")
 
     # ---------------- Target behavior ----------------
     def on_target_change(self):
@@ -388,8 +460,10 @@ class SuperEbookMachine(tk.Tk):
             messagebox.showerror("Input types", str(e))
             return
 
+        copying = bool(self.no_convert_var.get())
+
         # Target sanity check (help users avoid AZW3-in-app confusion)
-        if self.target_var.get() == "app" and self.out_fmt_var.get().lower() != "epub":
+        if (not copying) and self.target_var.get() == "app" and self.out_fmt_var.get().lower() != "epub":
             if messagebox.askyesno(
                 "Format mismatch",
                 "Kindle apps require EPUB via Send-to-Kindle.\n\nSwitch output format to EPUB?"
@@ -402,6 +476,7 @@ class SuperEbookMachine(tk.Tk):
         profile = self.profile_var.get().strip()
         workers = max(1, int(self.workers_var.get()))
         overwrite = bool(self.overwrite_var.get())
+        flatten = bool(self.flatten_output_var.get())
 
         # Reset state
         self.stop_event.clear()
@@ -419,7 +494,12 @@ class SuperEbookMachine(tk.Tk):
         self.log_line(f"Output: {out_root}")
         self.log_line(f"Scan types: {', '.join(sorted(selected_exts))}")
         self.log_line(f"Target: {'Kindle App' if self.target_var.get() == 'app' else 'Physical Kindle'}")
-        self.log_line(f"Convert -> {out_fmt} | Profile: {profile} | Workers: {workers} | Overwrite: {overwrite}")
+        if copying:
+            self.log_line(f"Mode: COPY (no conversion) | Workers: {workers} | Overwrite: {overwrite} | Flatten: {flatten}")
+        else:
+            self.log_line(
+                f"Convert -> {out_fmt} | Profile: {profile} | Workers: {workers} | Overwrite: {overwrite} | Flatten: {flatten}"
+            )
         self.log_line("----")
 
         def background():
@@ -440,15 +520,24 @@ class SuperEbookMachine(tk.Tk):
                     self.ui_call(lambda: self.status_var.set("No matching files found."))
                     return
 
-                extra_args = ["--output-profile", profile]
+                extra_args = [] if copying else ["--output-profile", profile]
 
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futures = []
                     for f in files:
                         if self.stop_event.is_set():
                             break
-                        outp = build_out_path(in_root, out_root, f, out_fmt)
-                        futures.append(ex.submit(self._convert_one, calibre, f, outp, extra_args, overwrite))
+                        outp = build_out_path(
+                            in_root,
+                            out_root,
+                            f,
+                            out_fmt,
+                            flatten=flatten,
+                            keep_input_ext=copying,
+                        )
+                        futures.append(
+                            ex.submit(self._process_one, calibre, f, outp, extra_args, overwrite, copying)
+                        )
 
                     for fut in as_completed(futures):
                         if self.stop_event.is_set():
@@ -483,11 +572,26 @@ class SuperEbookMachine(tk.Tk):
         self.worker_thread = threading.Thread(target=background, daemon=True)
         self.worker_thread.start()
 
-    def _convert_one(self, calibre: str, in_path: Path, out_path: Path, extra_args, overwrite: bool):
+    def _process_one(
+        self,
+        calibre: str,
+        in_path: Path,
+        out_path: Path,
+        extra_args,
+        overwrite: bool,
+        copying: bool,
+    ):
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
         if out_path.exists() and not overwrite:
             return "skip", f"SKIP exists: {out_path}"
+
+        if copying:
+            try:
+                shutil.copy2(in_path, out_path)
+                return "ok", f"OK   {out_path}"
+            except Exception as e:
+                return "fail", f"FAIL {in_path} -> {out_path} :: {e}"
 
         cmd = [calibre, str(in_path), str(out_path)] + list(extra_args)
 
