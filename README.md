@@ -148,7 +148,7 @@ Packaged using PyInstaller:
 pyinstaller --onefile --windowed --name "SuperEbookMachine" SuperEbookMachine.py
 
 dist\SuperEbookMachine.exe
-
+```
 ## License
 
 Provided as-is for personal use.
